@@ -5,89 +5,94 @@ from playwright.async_api import async_playwright
 from flask import Flask
 from threading import Thread
 
-# ১. রেন্ডারের পোর্ট এরর (Port Scan Timeout) ফিক্স করার জন্য Flask সেটআপ
+# ১. রেন্ডারকে জাগিয়ে রাখার জন্য Flask
 app = Flask('')
-
 @app.route('/')
-def home():
-    return "I am alive and running!"
+def home(): return "WhatsApp QR Bot is Active!"
+def run(): app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8080)))
+def keep_alive(): Thread(target=run).start()
 
-def run():
-    # রেন্ডার থেকে অটোমেটিক পোর্ট নম্বর নেওয়ার জন্য os.environ ব্যবহার করা হয়েছে
-    port = int(os.environ.get('PORT', 8080))
-    app.run(host='0.0.0.0', port=port)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-# ২. তোমার টেলিগ্রাম বট সেটআপ (টেস্ট টোকেন সহ)
 TOKEN = '8651423664:AAEQu1P-mWgsCYRtW_TMBDoGStWjMTEJAv4'
 bot = telebot.TeleBot(TOKEN)
 
-async def get_whatsapp_pfp(phone):
+# সেশন সেভ করার ফোল্ডার (রেন্ডারে এটা সাময়িক হবে)
+SESSION_DIR = "user_data"
+
+async def get_qr_and_login(chat_id):
     async with async_playwright() as p:
-        # রেন্ডার সার্ভারের জন্য ব্রাউজার লঞ্চ সেটিংস
-        browser = await p.chromium.launch(
-            headless=True, 
-            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-        )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36"
+        # সেশন ডাটা ধরে রাখার জন্য launch_persistent_context ব্যবহার করা হয়েছে
+        context = await p.chromium.launch_persistent_context(
+            SESSION_DIR,
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
         )
         page = await context.new_page()
         
         try:
-            # সরাসরি হোয়াটসঅ্যাপ চ্যাট লিঙ্কে যাওয়া
-            url = f"https://web.whatsapp.com/send?phone={phone}"
-            await page.goto(url, wait_until="networkidle", timeout=60000)
+            await page.goto("https://web.whatsapp.com", wait_until="networkidle")
             
-            # হোয়াটসঅ্যাপ লোড হওয়ার জন্য ২০ সেকেন্ড অপেক্ষা
-            await asyncio.sleep(20) 
+            # কিউআর কোড আসার জন্য অপেক্ষা
+            bot.send_message(chat_id, "⏳ কিউআর কোড জেনারেট হচ্ছে, একটু দাঁড়াও...")
+            await asyncio.sleep(10)
             
-            # প্রোফাইল পিকচার এলিমেন্ট খুঁজে বের করা
-            img_selector = 'header img'
-            await page.wait_for_selector(img_selector, timeout=15000)
-            img_url = await page.get_attribute(img_selector, "src")
-            return img_url
+            # কিউআর কোডের স্ক্রিনশট নেওয়া
+            await page.screenshot(path="qr.png")
+            with open("qr.png", "rb") as qr:
+                bot.send_photo(chat_id, qr, caption="📸 ভাই, তোমার হোয়াটসঅ্যাপ দিয়ে এই কোডটি স্ক্যান করো।\n(Linked Devices এ গিয়ে স্ক্যান করো)")
+            
+            # লগইন হওয়া পর্যন্ত অপেক্ষা (৬০ সেকেন্ড সময় পাবে)
+            bot.send_message(chat_id, "🕒 তোমার কাছে ৬০ সেকেন্ড সময় আছে স্ক্যান করার জন্য...")
+            await asyncio.sleep(60)
+            
+            await context.close()
+            bot.send_message(chat_id, "✅ লগইন প্রসেস শেষ! এখন তুমি নাম্বার পাঠাতে পারো।")
         except Exception as e:
-            print(f"Error fetching PFP: {e}")
-            return None
-        finally:
-            await browser.close()
+            bot.send_message(chat_id, f"❌ এরর: {str(e)}")
 
-@bot.message_handler(commands=['start', 'help'])
-def start(message):
-    bot.reply_to(message, "ভাই, নাম্বার দাও (Country Code সহ, যেমন: 88017...), আমি ছবি নিয়ে আসছি!")
+async def fetch_pfp(phone, chat_id):
+    async with async_playwright() as p:
+        # আগের সেভ করা সেশন দিয়ে ব্রাউজার খোলা
+        context = await p.chromium.launch_persistent_context(
+            SESSION_DIR,
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
+        page = await context.new_page()
+        try:
+            url = f"https://web.whatsapp.com/send?phone={phone}"
+            await page.goto(url, wait_until="networkidle")
+            await asyncio.sleep(15) # প্রোফাইল লোড হতে সময় লাগে
+            
+            img_selector = 'header img'
+            await page.wait_for_selector(img_selector, timeout=20000)
+            img_url = await page.get_attribute(img_selector, "src")
+            
+            if img_url:
+                bot.send_photo(chat_id, img_url, caption=f"✅ {phone} এর ছবি পাওয়া গেছে।")
+            else:
+                bot.send_message(chat_id, "❌ ছবি পাওয়া যায়নি।")
+        except:
+            bot.send_message(chat_id, "⚠️ সেশন কাজ করছে না বা ছবি লক করা। আবার /login করো।")
+        finally:
+            await context.close()
+
+@bot.message_handler(commands=['login'])
+def login_command(message):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(get_qr_and_login(message.chat.id))
 
 @bot.message_handler(func=lambda m: True)
-def handle_message(message):
-    phone = message.text.strip()
-    
-    # শুধু নাম্বার কি না চেক করা
-    if not phone.isdigit():
-        bot.reply_to(message, "❌ ভাই শুধু নাম্বার দাও (কোনো স্পেস বা চিহ্ন ছাড়া)।")
-        return
-
-    bot.reply_to(message, f"🔍 {phone} এর ছবি খোঁজা হচ্ছে, একটু সময় দাও...")
-    
-    try:
-        # এসিনক্রোনাস ফাংশনটি রান করা
+def handle_msg(message):
+    phone = "".join(filter(str.isdigit, message.text))
+    if len(phone) >= 10:
+        bot.reply_to(message, "🔍 ছবি খোঁজা হচ্ছে...")
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        photo_url = loop.run_until_complete(get_whatsapp_pfp(phone))
-        loop.close()
-        
-        if photo_url:
-            bot.send_photo(message.chat.id, photo_url, caption=f"✅ {phone} এর প্রোফাইল পিকচার")
-        else:
-            bot.reply_to(message, "❌ ছবি পাওয়া যায়নি। হয়তো নাম্বারটি ভুল বা হোয়াটসঅ্যাপে নেই অথবা প্রাইভেসি অন করা।")
-    except Exception as e:
-        bot.reply_to(message, f"⚠️ দুঃখিত ভাই, একটা সমস্যা হয়েছে। আবার চেষ্টা করো।")
+        loop.run_until_complete(fetch_pfp(phone, message.chat.id))
+    else:
+        bot.reply_to(message, "❌ সঠিক নাম্বার দাও ভাই।")
 
-# ৩. মেইন ফাংশন: ওয়েবসাইট এবং বট একসাথে চালু করা
 if __name__ == "__main__":
-    keep_alive() # এটা রেন্ডারকে শান্ত রাখবে
-    print("বট সচল আছে...")
-    # none_stop=True যাতে এরর আসলেও বট বন্ধ না হয়
+    keep_alive()
     bot.polling(none_stop=True)
